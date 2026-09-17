@@ -1,0 +1,41 @@
+# Portable helper contract
+
+`python3 <skill>/scripts/offload.py [--root DIR] ACTION ...` uses Python 3 standard library on macOS/Linux. Windows is unsupported. Default root: `$AGENT_OFFLOAD_ROOT`, otherwise `~/.local/state/agent-offload`. Both skills use the same registry. Pass the same root to every command if overridden. Copying either skill directory is enough; neither depends on the other.
+
+## Options
+
+- `start --tool codex|claude --cwd DIR --prompt-file FILE [--id ID] [--mode read|edit] [--lease-seconds 300] [--max-runtime 1800] [--owner-pid PID] [--interrupt-grace 15] [--allow-non-git]`. Bounds are finite positive seconds. Explicit ID makes identical retries idempotent; conflicting reuse fails. Read is default. Codex read mode accepts non-Git workspaces; edit mode requires explicit `--allow-non-git` when intentional. This does not repair Git errors.
+- Claude only: `--tools Read,Glob,Grep,Write,Edit,Bash` selects built-ins; these flags are rejected for Codex rather than silently ignored. Repeat `--allow-tool 'Bash(python3:*)'` for needed permissions (include Read/Glob/etc. separately). `--add-dir DIR` adds context. By default read allows Read/Glob/Grep and edit adds Write/Edit, with no Bash or MCP. Selecting Bash with `--tools` does not grant it; an explicit `--allow-tool` is required. Read mode rejects tools outside Read/Glob/Grep/WebSearch/WebFetch. Grants must reflect the caller's authority. Global/project hooks and plugins may still apply.
+- `status ID [--no-touch]`: compact result, progress, state, session ID, process identities, diagnostics and log path. Default renews lease. Inspect main-model evidence separately from aggregate Claude usage.
+- `read ID [--cursor RUN:OFFSET] [--max-bytes 65536]`: complete JSONL events only, next cursor, partial-tail indication. Offset is bytes, not characters. A whole event may exceed the requested page size; events above 8 MiB require direct file inspection. A cursor from an older run is rejected. Malformed complete lines are surfaced, not silently discarded.
+- `wait ID [--timeout 30]`: renew once, wait at most 60 seconds, return completion/attention or timeout. Exit 124 means the **wait** elapsed; check state to distinguish this from the run's own deadline. It does not cancel on wait timeout.
+- `touch ID`: renew lease and return status. Caller activity, not child output, renews the lease.
+- `send ID --prompt-file FILE --request-id TOKEN`: exact-session continuation, retaining original model/permissions/bounds. New process, incremented run number, fresh lease/runtime. Same token and prompt returns original run; different content with same token fails. No automatic queue or live steering. To change permissions, start a separate explicitly authorized task with needed context; this helper does not silently widen a saved profile.
+- `stop ID`: request SIGINT, then SIGTERM after the explicit-stop grace (15 seconds default), then SIGKILL 3 seconds later if needed. Follow with wait; response alone is not confirmation of exit. For a lost worker, it attempts verified-child cleanup and records acknowledgement.
+- `list`: registry summary, no heartbeat.
+
+JSON operation success exits 0; invalid input/setup errors 2; completed wait requiring attention 3; busy/conflicting request 4; wait timeout 124. Argparse usage errors may use stderr. Status/list do not exit nonzero merely because the child failed: inspect JSON state.
+
+## State and success
+
+Active: `starting`, `running`, `stopping`. Terminal: `done`, `failed`, `needs_input`, `interrupted`, `expired`, `owner_lost`, `timed_out`. `lost` means no trustworthy worker exit record and no matching live worker; it blocks send until explicit `stop` recovery.
+
+`transport_success` requires recorded zero exit, success terminal event, complete valid JSONL, no recorded stop and no reported model/Fast mismatch. This never proves semantic task success. Child text beginning `NEEDS_INPUT:` yields `needs_input`; that convention is advisory, not a permission callback. Denials remain in `permission_denials` and can coexist with a completed task. Model/transport failures are not automatically retried.
+
+Each offload holds its immutable launch profile, request IDs, and current run number in `offload.json`; each numbered run has its own prompt, command, events, stderr, worker/watchdog metadata and stop record. Files are private to the user by default. Prompts may include private context; don't commit runtime state. Logs remain for recovery until deliberately removed after confirming completion.
+
+## Ownership, crashes and concurrency
+
+The launching shell returns after a bounded startup handshake. A detached worker owns one CLI process group. A second small detached watchdog arms before the CLI begins work. It stops the CLI if the worker disappears, using the configured interrupt grace, and provides a hard-deadline backstop. A per-signal timeline records crash cleanup; transient process-inspection failures do not restart the escalation clock. Both exit with the run; nothing listens on a socket or survives as an installed service.
+
+The worker enforces lease/runtime/optional owner identity and records child exit. Monotonic timers may pause across laptop sleep; bounds concern time on the running machine. A child is gated until the watchdog is ready. Signals are sent only to the owned process group, with process identity checks for persisted handles. Same-group subprocesses are cleaned up even after normal CLI completion. A descendant that deliberately creates another session escapes that group and cannot be promised cleanup. Killing both worker and watchdog can leave the CLI alive; use `status` and `stop` on the saved ID to recover. Machine reboot kills processes but leaves logs and requires treating an unfinished record as lost.
+
+Lease default is 300 seconds plus up to 6 seconds signal grace. Owner death is usually observed within a polling interval, then the same grace. A stable explicit owner improves prompt cancellation but is optional. macOS process identity uses PID and OS start timestamp (second precision); this is substantially safer than PID-only checks, but not a cryptographic identity guarantee. OS process-inspection denial fails clearly rather than treating it as proof the process died.
+
+A registry lock serializes start/send decisions. Duplicate request IDs don't start duplicate paid work. Two edit offloads to equal or nested resolved working directories are refused while either is active/lost. Use separate workspaces; read-only calls can overlap. This coordinates this registry only, not arbitrary CLI processes, another root, or a human editor. Resume never guesses with `--last` or `--continue`.
+
+The CLI session UUID is conversation identity; the offload ID identifies this helper's ownership record; run number identifies one process invocation; the host job handle belongs to the calling app. A skill cannot add native agent tools or guarantee unsolicited completion notification. Use repeated bounded wait calls, optionally through the host background-job facility while the parent remains active.
+
+## Changing destination parameters
+
+Run `offload.py start --help` for supported options; model/effort/speed presets are fixed as documented in SKILL.md. The helper intentionally owns session/model/output/permission/lifecycle flags. For parameters it doesn't expose (images, schema output, forks, custom MCP configuration), use the full CLI surface in `cli-reference.md` and the direct-call recipes in `workflows.md`, with finite timeout and explicit host ownership. Do not append unvalidated flags to the lifecycle helper or claim its protections apply to a direct call.

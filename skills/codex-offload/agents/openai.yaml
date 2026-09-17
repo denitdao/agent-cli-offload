@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Offload"
+  short_description: "Delegate work to Codex and verify its result"
+  default_prompt: "Use $codex-offload to delegate this task and verify the result."

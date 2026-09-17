@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude Offload"
+  short_description: "Delegate work to Claude and verify its result"
+  default_prompt: "Use $claude-offload to delegate this task and verify the result."
