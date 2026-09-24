@@ -16,11 +16,26 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 import uuid
 
 ACTIVE = {'starting', 'running', 'stopping'}
 ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$')
-MODELS = {'codex': 'gpt-6-astra', 'claude': 'claude-fable-5-1'}
+# Flagship family used when the caller names no model; resolved to its newest release.
+DEFAULT_FAMILY = {'codex': 'astra', 'claude': 'fable'}
+# Offloads created before model selection existed pinned these exact IDs.
+LEGACY_MODELS = {'codex': 'gpt-6-astra', 'claude': 'claude-fable-5-1'}
+CLAUDE_EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+# Claude Code's latest-release family aliases. An unlisted lowercase word is treated as a
+# newer family; composite aliases select a model per mode, so they cannot be verified.
+CLAUDE_FAMILIES = ('fable', 'opus', 'sonnet', 'haiku')
+CLAUDE_COMPOSITE_ALIASES = ('default', 'best', 'opusplan')
+CODEX_SLUG_RE = re.compile(r'^gpt-(\d+(?:\.\d+)*)-([a-z]+)$')
+CLAUDE_ID_RE = re.compile(r'^claude-([a-z]+)-(\d+(?:-\d+)*?)(?:-\d{8})?$')
+CLAUDE_ALIAS_RE = re.compile(r'^([a-z]+)(\[[a-z0-9]+\])?$')
+FAMILY_RE = re.compile(r'^[a-z]+$')
+EFFORT_RE = re.compile(r'^[a-z]+$')
+MODEL_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,255}$')
 
 
 IDENTITY_CACHE = {}
@@ -109,10 +124,214 @@ def touch(job):
     save(job / 'lease.json', {'monotonic': time.monotonic(), 'at': now()})
 
 
-def events_summary(path, tool):
+def version_key(text):
+    return tuple(int(part) for part in text.split('.'))
+
+
+def codex_catalogue(executable):
+    errors = []
+    # The default call may refresh the catalogue online; the bundled copy works offline.
+    for extra in ([], ['--bundled']):
+        try:
+            p = subprocess.run([executable, 'debug', 'models', *extra], capture_output=True, text=True,
+                               timeout=30, stdin=subprocess.DEVNULL)
+            if p.returncode:
+                raise ValueError('exit %s: %s' % (p.returncode, p.stderr.strip()[-300:]))
+            models = json.loads(p.stdout)['models']
+            if not isinstance(models, list):
+                raise ValueError('no model list')
+            return [m for m in models if isinstance(m, dict) and isinstance(m.get('slug'), str)]
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as error:
+            errors.append(str(error))
+    raise Failure('Cannot read the Codex model catalogue (`codex debug models`): ' + '; '.join(errors))
+
+
+def listed(entry):
+    return entry.get('visibility', 'list') == 'list'
+
+
+def efforts_of(entry):
+    return [level['effort'] for level in entry.get('supported_reasoning_levels') or []
+            if isinstance(level, dict) and isinstance(level.get('effort'), str)]
+
+
+def newest_codex(catalogue):
+    """Newest listed release per gpt-<version>-<family> family."""
+    newest = {}
+    for entry in catalogue:
+        match = CODEX_SLUG_RE.fullmatch(entry['slug'])
+        if match and listed(entry):
+            key = version_key(match.group(1))
+            if match.group(2) not in newest or key > newest[match.group(2)][0]:
+                newest[match.group(2)] = (key, entry)
+    return {family: pair[1] for family, pair in newest.items()}
+
+
+def codex_models(executable, include_hidden):
+    catalogue = codex_catalogue(executable)
+    models = []
+    for entry in sorted(catalogue, key=lambda e: (not isinstance(e.get('priority'), (int, float)),
+                                                  e.get('priority') if isinstance(e.get('priority'), (int, float)) else 0,
+                                                  e['slug'])):
+        if not listed(entry) and not include_hidden:
+            continue
+        match = CODEX_SLUG_RE.fullmatch(entry['slug'])
+        models.append(dict(id=entry['slug'], display_name=entry.get('display_name'),
+                           description=entry.get('description'), family=match.group(2) if match else None,
+                           listed=listed(entry), efforts=efforts_of(entry),
+                           context_window=entry.get('context_window'), upgrade=entry.get('upgrade')))
+    return dict(tool='codex', source='codex debug models', default=DEFAULT_FAMILY['codex'], default_effort='high',
+                models=models,
+                latest_by_family={family: entry['slug'] for family, entry in newest_codex(catalogue).items()},
+                usage='Pass a family (newest release) or an exact id to start --model.')
+
+
+def claude_models(executable, probe):
+    result = dict(tool='claude', default=DEFAULT_FAMILY['claude'], default_effort='high',
+                  aliases=list(CLAUDE_FAMILIES), efforts=list(CLAUDE_EFFORTS),
+                  usage='Pass a family alias (newest release), optionally with a suffix such as opus[1m], '
+                        'or an exact claude-... id to start --model.')
+    key = os.environ.get('ANTHROPIC_API_KEY')
+    if key:
+        base = os.environ.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com').rstrip('/')
+        request = urllib.request.Request(base + '/v1/models?limit=1000',
+                                         headers={'x-api-key': key, 'anthropic-version': '2023-06-01'})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = json.load(response)['data']
+            models, newest = [], {}
+            for entry in data:
+                if not isinstance(entry, dict) or not isinstance(entry.get('id'), str):
+                    continue
+                match = CLAUDE_ID_RE.fullmatch(entry['id'])
+                family = match.group(1) if match else None
+                created = str(entry.get('created_at') or '')
+                models.append(dict(id=entry['id'], display_name=entry.get('display_name'),
+                                   family=family, created_at=created or None))
+                if family and (family not in newest or created > newest[family][0]):
+                    newest[family] = (created, entry['id'])
+            result.update(source='Anthropic Models API (ANTHROPIC_API_KEY account)', models=models,
+                          latest_by_family={family: pair[1] for family, pair in newest.items()})
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            result['api_error'] = str(error)
+    if 'models' not in result:
+        result.update(source='Claude Code aliases', note=(
+            'Claude Code has no offline model list. Each alias selects the newest release of its family that '
+            'the installed CLI knows; `models --tool claude --probe ALIAS` makes one tiny paid call to show which. '
+            'Current IDs: https://docs.claude.com/en/docs/about-claude/models/overview'))
+    if probe:
+        if os.environ.get('CLAUDECODE'):
+            raise Failure('Nested Claude environment detected (CLAUDECODE); cannot probe from inside Claude Code.')
+        result['probe'] = {}
+        for alias in probe:
+            if not MODEL_RE.fullmatch(alias):
+                result['probe'][alias] = {'error': 'not a model alias or ID'}
+                continue
+            try:
+                # Neutral directory: project instructions and hooks are irrelevant to a model lookup.
+                p = subprocess.run([executable, '-p', '--model', alias, '--effort', 'low', '--tools', '',
+                                    '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+                                    '--settings', '{"fastMode":false,"ultracode":false}', '--no-session-persistence',
+                                    '--output-format', 'stream-json', '--verbose'],
+                                   input='Reply with the single word OK.', capture_output=True, text=True, timeout=120,
+                                   cwd=tempfile.gettempdir(), env={**os.environ, 'CLAUDE_CODE_DISABLE_FAST_MODE': '1'})
+                observed = []
+                for line in p.stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict) and event.get('type') == 'system' and event.get('subtype') == 'init':
+                        observed.append(event.get('model'))
+                result['probe'][alias] = observed[0] if observed and p.returncode == 0 else {
+                    'error': (p.stderr.strip() or p.stdout.strip())[-500:] or 'exit %s' % p.returncode}
+            except (OSError, subprocess.TimeoutExpired) as error:
+                result['probe'][alias] = {'error': str(error)}
+    return result
+
+
+def list_models(args):
+    executable = shutil.which(args.tool)
+    if not executable:
+        raise Failure('Required CLI not found on PATH: ' + args.tool)
+    if args.tool == 'codex':
+        if args.probe:
+            raise Failure('--probe is Claude-only; the Codex catalogue is already exact')
+        return codex_models(executable, args.all)
+    return claude_models(executable, args.probe)
+
+
+def normalize_request(tool, spec, effort):
+    """Canonical (model, effort) request; stored in the manifest and hashed for idempotency."""
+    spec = (spec or DEFAULT_FAMILY[tool]).strip()
+    effort = (effort or 'high').strip().lower()
+    if not MODEL_RE.fullmatch(spec):
+        raise Failure('--model must be a family alias (e.g. opus, sol) or an exact model ID')
+    if not EFFORT_RE.fullmatch(effort):
+        raise Failure('--effort must be a single word such as low, medium, high, xhigh or max')
+    lower = spec.lower()
+    if tool == 'codex' or CLAUDE_ALIAS_RE.fullmatch(lower) or lower.startswith('claude-'):
+        spec = lower
+    return spec, effort
+
+
+def resolve_model(tool, executable, spec, effort):
+    """Turn a normalized request into the model the CLI is asked for.
+
+    Codex families resolve to the newest listed gpt-<version>-<family>. Claude
+    families use the CLI's own latest-model alias and are verified by family.
+    """
+    if tool == 'claude':
+        if effort not in CLAUDE_EFFORTS:
+            raise Failure('Claude effort must be one of: ' + ', '.join(CLAUDE_EFFORTS))
+        alias = CLAUDE_ALIAS_RE.fullmatch(spec)
+        if alias and alias.group(1) in CLAUDE_COMPOSITE_ALIASES:
+            return dict(model=spec, model_family=None, resolved_model=None, model_verified=False)
+        return dict(model=spec, model_family=alias.group(1) if alias else None, resolved_model=None,
+                    model_verified=True)
+    catalogue = codex_catalogue(executable)
+    exact = next((e for e in catalogue if e['slug'].lower() == spec), None)
+    family = spec if FAMILY_RE.fullmatch(spec) and exact is None else None
+    entry = newest_codex(catalogue).get(family) if family else exact
+    if entry is None:
+        names = ', '.join(sorted(e['slug'] for e in catalogue if listed(e)))
+        raise Failure('No Codex model or family %r. Available: %s. Run `offload.py models --tool codex`.'
+                      % (spec, names))
+    levels = efforts_of(entry)
+    if levels and effort not in levels:
+        raise Failure('%s does not support %s effort; supported: %s' % (entry['slug'], effort, ', '.join(levels)))
+    return dict(model=entry['slug'], model_family=family, resolved_model=entry['slug'], model_verified=False)
+
+
+def model_settings(meta):
+    """Model selection for a manifest; manifests without one keep their legacy pin."""
+    model = meta.get('model') or LEGACY_MODELS[meta['tool']]
+    return dict(requested_model=model, model_family=meta.get('model_family'),
+                resolved_model=meta.get('resolved_model') or (None if meta.get('model') else model),
+                effort=meta.get('effort', 'high'), model_verified=meta.get('model_verified', meta['tool'] == 'claude'))
+
+
+def canonical_claude_id(value):
+    """Comparable Claude ID: drop provider prefixes, context suffixes and snapshot dates."""
+    value = value.lower().split('[', 1)[0]
+    value = value[value.find('claude-'):] if 'claude-' in value else value
+    return re.sub(r'-\d{8}$', '', re.sub(r'-v\d+(:\d+)?$', '', value))
+
+
+def model_matches(observed, settings):
+    if not settings['model_verified']:
+        return True
+    observed = canonical_claude_id(observed)
+    if settings['model_family'] and not settings['resolved_model']:
+        return observed.startswith('claude-%s-' % settings['model_family'])
+    return observed == canonical_claude_id(settings['resolved_model'] or settings['requested_model'])
+
+
+def events_summary(path, tool, settings=None):
     result = dict(session_id=None, terminal_event=None, agent_success=False,
                   permission_denials=[], malformed_lines=0, partial_tail=False,
-                  last_message='', observed_model=None, fast_mode_state=None, observed_models=[])
+                  last_message='', observed_model=None, init_model=None, fast_mode_state=None,
+                  observed_models=[])
     if not path.exists():
         return result
     with path.open('rb') as stream:
@@ -145,7 +364,7 @@ def events_summary(path, tool):
                     continue
                 if kind == 'system' and event.get('subtype') == 'init':
                     result.update(session_id=event.get('session_id'),
-                                  observed_model=event.get('model'),
+                                  observed_model=event.get('model'), init_model=event.get('model'),
                                   fast_mode_state=event.get('fast_mode_state'))
                     if event.get('model') and event['model'] not in result['observed_models']:
                         result['observed_models'].append(event['model'])
@@ -165,7 +384,8 @@ def events_summary(path, tool):
                                   agent_success=event.get('subtype') == 'success' and event.get('is_error') is False,
                                   permission_denials=event.get('permission_denials', []),
                                   last_message=str(event.get('result', '')))
-    result['model_mismatch'] = bool(tool == 'claude' and any(model != MODELS[tool] for model in result['observed_models']))
+    result['model_mismatch'] = bool(tool == 'claude' and settings and
+                                    any(not model_matches(model, settings) for model in result['observed_models']))
     result['fast_mode_mismatch'] = result.get('fast_mode_state') == 'on'
     return result
 
@@ -175,10 +395,10 @@ def inspect(job, number=None):
     number = number or meta['run']
     directory = run_dir(job, number)
     record = load(directory / 'run.json')
-    summary = events_summary(directory / 'events.jsonl', meta['tool'])
-    result = {**record, **summary, 'offload_id': job.name, 'run': number,
-              'tool': meta['tool'], 'cwd': meta['cwd'], 'run_dir': str(directory),
-              'requested_model': MODELS[meta['tool']], 'effort': 'high', 'speed': 'standard',
+    settings = model_settings(meta)
+    summary = events_summary(directory / 'events.jsonl', meta['tool'], settings)
+    result = {**record, **summary, **settings, 'offload_id': job.name, 'run': number,
+              'tool': meta['tool'], 'cwd': meta['cwd'], 'run_dir': str(directory), 'speed': 'standard',
               'lease_seconds': meta['lease_seconds'], 'max_runtime': meta['max_runtime']}
     if not summary.get('session_id'):
         result['session_id'] = record.get('resume_session_id')
@@ -214,9 +434,11 @@ def inspect(job, number=None):
 
 def argv_for(meta, session):
     exe = meta['executable']
+    settings = model_settings(meta)
+    model = settings['resolved_model'] or settings['requested_model']
     if meta['tool'] == 'codex':
-        command = [exe, '-a', 'never', 'exec', '-m', MODELS['codex'],
-                   '-c', 'model_reasoning_effort="high"', '-c', 'service_tier="default"',
+        command = [exe, '-a', 'never', 'exec', '-m', model,
+                   '-c', 'model_reasoning_effort="%s"' % settings['effort'], '-c', 'service_tier="default"',
                    '-c', 'approval_policy="never"',
                    '--disable', 'fast_mode', '-s', 'read-only' if meta['mode'] == 'read' else 'workspace-write',
                    '-C', meta['cwd'], '--json']
@@ -227,7 +449,7 @@ def argv_for(meta, session):
         else:
             command += ['-']
         return command
-    command = [exe, '-p', '--model', MODELS['claude'], '--effort', 'high',
+    command = [exe, '-p', '--model', model, '--effort', settings['effort'],
                '--settings', '{"fastMode":false,"ultracode":false}',
                '--output-format', 'stream-json', '--verbose',
                '--permission-mode', 'dontAsk', '--permission-prompts', 'none',
@@ -307,25 +529,33 @@ def start(root, args):
     tools = [t.strip() for t in tools if t.strip()]
     if args.mode == 'read' and set(tools) - {'Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'}:
         raise Failure('Read mode only allows reading/search tools; use edit mode for other tools')
-    allowed = args.allow_tool or [t for t in tools if t != 'Bash']
+    # Selected tools other than Bash are allowed; --allow-tool adds rules such as 'Bash(npm test)'.
+    allowed = [t for t in tools if t != 'Bash']
+    allowed += [t for t in args.allow_tool if t not in allowed]
     if any(t.split('(')[0] not in tools for t in allowed):
         raise Failure('Allowed tools must also be selected in --tools')
-    if args.mode == 'read' and any(t.split('(')[0] not in tools for t in allowed):
-        raise Failure('Allowed tools must belong to the read-mode tool set')
     if args.tool == 'claude' and os.environ.get('CLAUDECODE'):
         raise Failure('Nested Claude environment detected (CLAUDECODE). Use Codex for this offload or diagnose the launcher; no automatic environment bypass.')
     owner_stamp = identity(args.owner_pid) if args.owner_pid else None
     if args.owner_pid and not owner_stamp:
         raise Failure('--owner-pid must identify a live, stable caller process')
-    meta = dict(version=2, tool=args.tool, executable=str(Path(executable).resolve()), cwd=cwd, mode=args.mode,
+    model, effort = normalize_request(args.tool, args.model, args.effort)
+    meta = dict(version=3, tool=args.tool, executable=str(Path(executable).resolve()), cwd=cwd, mode=args.mode,
                 tools=tools, allowed_tools=allowed, add_dirs=[str(Path(d).resolve(strict=True)) for d in args.add_dir],
                 lease_seconds=args.lease_seconds, max_runtime=args.max_runtime,
                 interrupt_grace=args.interrupt_grace, allow_non_git=args.allow_non_git,
-                owner_pid=args.owner_pid, owner_identity=owner_stamp, run=1, requests={})
+                owner_pid=args.owner_pid, owner_identity=owner_stamp, run=1, requests={},
+                model=model, effort=effort)
+    # Hash the request, not the catalogue answer, so an identical retry stays idempotent.
     digest = hashlib.sha256(json.dumps([meta, prompt], sort_keys=True).encode()).hexdigest()
+    # Manifests from before model selection hashed the same request without these keys.
+    legacy = {k: v for k, v in meta.items() if k not in ('model', 'effort')}
+    legacy_digest = hashlib.sha256(json.dumps([dict(legacy, version=2), prompt], sort_keys=True).encode()).hexdigest()
     meta['start_hash'] = digest
     job_id = args.id or uuid.uuid4().hex
     job = job_dir(root, job_id)
+    # An identical retry returns the existing offload without consulting the catalogue again.
+    selection = None if (job / 'offload.json').exists() else resolve_model(args.tool, executable, model, effort)
     with locked(root):
         if job.exists() and not (job / 'offload.json').exists():
             if not any(job.iterdir()):
@@ -334,10 +564,11 @@ def start(root, args):
                 raise Failure('Incomplete offload directory has no manifest; inspect it and use a new ID. Existing contents were preserved.')
         if job.exists():
             old = load(job / 'offload.json')
-            if old.get('start_hash') != digest:
+            if old.get('start_hash') not in (digest, legacy_digest if 'model' not in old else None):
                 raise Failure('Offload ID already exists with a different request', 4)
             touch(job)
             return inspect(job)
+        meta.update(selection or resolve_model(args.tool, executable, model, effort))
         check_writers(root, meta)
         job.mkdir(mode=0o700)
         return launch(job, meta, prompt)
@@ -356,14 +587,23 @@ def send(root, args):
                 raise Failure('Request ID was already used for a different prompt', 4)
             touch(job)
             return inspect(job, previous['run'])
+        if meta['tool'] == 'claude' and os.environ.get('CLAUDECODE'):
+            raise Failure('Nested Claude environment detected (CLAUDECODE). Continue this offload from a non-Claude caller.')
         status = inspect(job)
         if status['state'] in ACTIVE or status['state'] == 'lost':
             raise Failure('Offload is active or lost; inspect and stop it before resuming', 4)
+        if status.get('model_mismatch'):
+            raise Failure('The previous run failed the model check (observed %s); start a new offload'
+                          % ', '.join(status.get('observed_models') or []))
         if not status['session_id']:
             raise Failure('No saved CLI session ID; start a new offload')
         if meta.get('owner_pid') and not alive(meta['owner_pid'], meta['owner_identity']):
             raise Failure('Original owner exited; start a new offload with a live owner')
         check_writers(root, meta, job.name)
+        if meta['tool'] == 'claude' and meta.get('model_family') and not meta.get('resolved_model'):
+            # Keep the conversation on the release that answered it, even if the alias moves.
+            # The init model keeps variant suffixes such as [1m] that message IDs omit.
+            meta['resolved_model'] = status.get('init_model') or status.get('observed_model')
         meta['run'] += 1
         meta['requests'][request] = {'hash': digest, 'run': meta['run']}
         return launch(job, meta, prompt, status['session_id'])
@@ -487,7 +727,7 @@ def worker(root, args):
     try:
         env = dict(os.environ)
         if meta['tool'] == 'claude':
-            env.update(CLAUDE_CODE_DISABLE_FAST_MODE='1', CLAUDE_CODE_EFFORT_LEVEL='high')
+            env.update(CLAUDE_CODE_DISABLE_FAST_MODE='1', CLAUDE_CODE_EFFORT_LEVEL=model_settings(meta)['effort'])
         with (directory / 'prompt.txt').open('rb') as source, (directory / 'events.jsonl').open('wb') as out, (directory / 'stderr.log').open('wb') as err:
             child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--root', str(root),
                                       '_child', job.name, str(args.number)], cwd=meta['cwd'], stdin=source,
@@ -526,7 +766,7 @@ def worker(root, args):
                             record['identity_warning'] = str(error)
                     if not reason and meta['tool'] == 'claude' and elapsed - last_model_check >= 2:
                         last_model_check = elapsed
-                        observed = events_summary(directory / 'events.jsonl', 'claude')
+                        observed = events_summary(directory / 'events.jsonl', 'claude', model_settings(meta))
                         if observed.get('model_mismatch') or observed.get('fast_mode_mismatch'):
                             reason = 'model_mismatch'
                     if reason:
@@ -628,7 +868,7 @@ def stop(root, job):
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--root', default=os.environ.get('AGENT_OFFLOAD_ROOT', str(Path.home() / '.local/state/agent-offload')))
-    sub = p.add_subparsers(dest='action', required=True)
+    sub = p.add_subparsers(dest='action', required=True, metavar='ACTION')
     s = sub.add_parser('start', help='Start a bounded offload and return immediately')
     s.add_argument('--tool', choices=['codex', 'claude'], required=True)
     s.add_argument('--cwd', required=True)
@@ -638,13 +878,22 @@ def parser():
     s.add_argument('--lease-seconds', type=float, default=300)
     s.add_argument('--max-runtime', type=float, default=1800)
     s.add_argument('--owner-pid', type=int)
+    s.add_argument('--model', help='Family alias for its newest release (see `models`; e.g. claude: fable, opus, '
+                   'sonnet, haiku; codex: astra, sol, luna) or an exact model ID. Default: fable / astra')
+    s.add_argument('--effort', default='high', help='Reasoning effort (default high). Claude: low, medium, high, xhigh, '
+                   'max; Codex: the levels the chosen model lists in `models`')
     s.add_argument('--interrupt-grace', type=float, default=15, help='Seconds before escalating an explicit stop to SIGTERM')
     s.add_argument('--allow-non-git', action='store_true', help='Allow Codex edit mode outside a Git repository')
     s.add_argument('--tools', help='Claude built-in tool set; comma separated')
     s.add_argument('--allow-tool', action='append', default=[], help='Claude permission pattern; repeatable')
     s.add_argument('--add-dir', action='append', default=[], help='Claude additional context directory')
+    helps = {'status': 'Show state and result; renews the lease unless --no-touch',
+             'read': 'Read new JSONL events from a cursor; renews the lease',
+             'wait': 'Wait up to 60s for completion or attention; renews the lease once',
+             'touch': 'Renew the lease and show status',
+             'stop': 'Request cancellation; follow with wait'}
     for name in ['status', 'read', 'wait', 'touch', 'stop']:
-        s = sub.add_parser(name)
+        s = sub.add_parser(name, help=helps[name])
         s.add_argument('id')
         if name == 'status':
             s.add_argument('--no-touch', action='store_true')
@@ -657,9 +906,14 @@ def parser():
     s.add_argument('id')
     s.add_argument('--prompt-file', required=True)
     s.add_argument('--request-id', required=True)
-    sub.add_parser('list')
+    sub.add_parser('list', help='Summarize all offloads in the registry without renewing leases')
+    s = sub.add_parser('models', help='List models the destination CLI can use and the newest per family')
+    s.add_argument('--tool', choices=['codex', 'claude'], required=True)
+    s.add_argument('--all', action='store_true', help='Codex: include hidden catalogue entries')
+    s.add_argument('--probe', action='append', default=[], metavar='ALIAS',
+                   help='Claude: one tiny paid call per alias to report the exact release it selects')
     for name in ('_worker', '_child', '_watchdog'):
-        s = sub.add_parser(name, help=argparse.SUPPRESS)
+        s = sub.add_parser(name)  # internal; no help keeps it out of the command list
         s.add_argument('id')
         s.add_argument('number', type=int)
     return p
@@ -677,6 +931,8 @@ def main():
             result = start(root, args)
         elif args.action == 'send':
             result = send(root, args)
+        elif args.action == 'models':
+            result = list_models(args)
         elif args.action == 'list':
             result = []
             if root.exists():

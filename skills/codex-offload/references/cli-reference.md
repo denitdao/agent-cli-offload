@@ -1,8 +1,8 @@
 # Codex CLI parameter reference
 
-Offload preference: `gpt-6-astra`, `model_reasoning_effort="high"`, `service_tier="default"`, and `--disable fast_mode`. The raw help below describes other available options, not permission to override this preference.
+Offload preset: the model and effort chosen as described in SKILL.md (default: newest `astra`, `high`), plus `service_tier="default"` and `--disable fast_mode`. The raw help below describes other available options, not permission to override the standard-speed preset.
 
-Captured from installed `codex` 0.154.0 on 2026-09-17. This is the complete **exposed** parameter surface for the root command and the delegation-related commands below, not a promise about undocumented internal flags or every administrative subcommand. Run the exact subcommand with `--help` after an upgrade. Root and subcommand flag placement matters. Configuration files have a separate, extensible schema.
+Captured from installed `codex` 0.156.1 on 2026-09-24. This is the complete **exposed** parameter surface for the root command and the delegation-related commands below, not a promise about undocumented internal flags or every administrative subcommand. Run the exact subcommand with `--help` after an upgrade. Root and subcommand flag placement matters. Configuration files have a separate, extensible schema.
 
 Read the relevant command section, not the whole reference by default.
 
@@ -137,6 +137,9 @@ Options:
           Disable alternate screen mode
           
           Runs the TUI in inline mode, preserving terminal scrollback history.
+
+      --no-daemon
+          Run without the shared background server, even if it is already running
 
   -h, --help
           Print help (see a summary with '-h')
@@ -571,13 +574,16 @@ Options:
           Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
           shell_environment_policy.inherit=all`
 
+      --enable <FEATURE>
+          Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
+
       --remote <ADDR>
           Connect the TUI to a remote app server endpoint.
           
           Accepted forms: `ws://host:port`, `wss://host:port`, `unix://`, or `unix://PATH`.
 
-      --enable <FEATURE>
-          Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
 
       --remote-auth-token-env <ENV_VAR>
           Name of the environment variable containing the bearer token to send to a remote app
@@ -585,9 +591,6 @@ Options:
 
   -C, --cd <DIR>
           Use this directory for new tasks on a remote server
-
-      --disable <FEATURE>
-          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
 
       --no-alt-screen
           Disable alternate screen mode
@@ -677,6 +680,37 @@ Options:
           
           Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
           shell_environment_policy.inherit=all`
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## debug models
+
+The helper's `models` command and `--model` resolution read this catalogue (JSON with a `models` array). It falls back to `--bundled` when the refresh fails.
+
+```text
+Render the raw model catalog as JSON
+
+Usage: codex debug models [OPTIONS]
+
+Options:
+      --bundled
+          Skip refresh and dump only the bundled catalog shipped with this binary
+
+  -c, --config <key=value>
+          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.
+          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed
+          as TOML. If it fails to parse as TOML, the raw string is used as a literal.
+          
+          Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
+          shell_environment_policy.inherit=all`
+
+      --enable <FEATURE>
+          Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
+
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
 
   -h, --help
           Print help (see a summary with '-h')

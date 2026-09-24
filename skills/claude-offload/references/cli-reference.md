@@ -1,8 +1,8 @@
 # Claude CLI parameter reference
 
-Offload preference: `claude-fable-5-1`, `--effort high`, `CLAUDE_CODE_EFFORT_LEVEL=high`, `CLAUDE_CODE_DISABLE_FAST_MODE=1`, and settings `fastMode: false`, `ultracode: false`. The raw help below describes other available options, not permission to override this preference.
+Offload preset: the model and effort chosen as described in SKILL.md (default: `fable` alias, `high`), passed as `--model`, `--effort` and `CLAUDE_CODE_EFFORT_LEVEL`, plus `CLAUDE_CODE_DISABLE_FAST_MODE=1` and settings `fastMode: false`, `ultracode: false`. The raw help below describes other available options, not permission to override the standard-speed preset.
 
-Captured from installed `claude` 2.1.274 on 2026-09-17. This is the complete **exposed** parameter surface for the root command and the delegation-related commands below, not a promise about undocumented internal flags or every administrative subcommand. Run the exact subcommand with `--help` after an upgrade. Root and subcommand flag placement matters. Configuration files have a separate, extensible schema.
+Captured from installed `claude` 2.1.281 on 2026-09-24. This is the complete **exposed** parameter surface for the root command and the delegation-related commands below, not a promise about undocumented internal flags or every administrative subcommand. Run the exact subcommand with `--help` after an upgrade. Root and subcommand flag placement matters. Configuration files have a separate, extensible schema.
 
 Read the relevant command section, not the whole reference by default.
 
@@ -22,10 +22,11 @@ Options:
                                         access to
   --agent <agent>                       Agent for the current session. Overrides
                                         the 'agent' setting.
-  --agents <json>                       JSON object defining custom agents (e.g.
-                                        '{"reviewer": {"description": "Reviews
-                                        code", "prompt": "You are a code
-                                        reviewer"}}')
+  --agents <json-or-file>               JSON object defining custom agents, or
+                                        with --print the path to a file that
+                                        holds one (e.g. '{"reviewer":
+                                        {"description": "Reviews code",
+                                        "prompt": "You are a code reviewer"}}')
   --allow-dangerously-skip-permissions  Enable bypassing all permission checks
                                         as an option, without it being enabled
                                         by default. Recommended only for
@@ -48,10 +49,13 @@ Options:
                                         session in the background under the same
                                         ID, or starts a copy and says so when
                                         the session is already running
-  --bare                                Minimal mode: skip hooks, LSP, plugin
-                                        sync, attribution, auto-memory,
-                                        background prefetches, keychain reads,
-                                        and CLAUDE.md auto-discovery. Sets
+  --bare                                Minimal mode: skip hooks (those defined
+                                        in settings and by installed plugins;
+                                        features built into Claude Code are
+                                        unaffected), LSP, plugin sync,
+                                        attribution, auto-memory, background
+                                        prefetches, keychain reads, and
+                                        CLAUDE.md auto-discovery. Sets
                                         CLAUDE_CODE_SIMPLE=1. Anthropic auth is
                                         strictly ANTHROPIC_API_KEY or
                                         apiKeyHelper via --settings (OAuth and
@@ -215,15 +219,15 @@ Options:
                                         open interactive picker with optional
                                         search term
   --safe-mode                           Start with all customizations
-                                        (CLAUDE.md, skills, plugins, hooks, MCP
-                                        servers, custom commands and agents,
-                                        output styles, workflows, custom themes,
-                                        keybindings, and more) disabled — useful
-                                        for troubleshooting a broken
+                                        (CLAUDE.md, skills, installed plugins,
+                                        hooks, MCP servers, custom commands and
+                                        agents, output styles, workflows, custom
+                                        themes, keybindings, and more) disabled
+                                        — useful for troubleshooting a broken
                                         configuration. Admin-managed (policy)
                                         settings still apply. Auth, model
-                                        selection, built-in tools, and
-                                        permissions work normally. Sets
+                                        selection, built-in tools and plugins,
+                                        and permissions work normally. Sets
                                         CLAUDE_CODE_SAFE_MODE=1.
   --session-id <uuid>                   Use a specific session ID for the
                                         conversation (must be a valid UUID)

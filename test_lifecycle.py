@@ -25,6 +25,19 @@ ACTIVE = {'starting', 'running', 'stopping'}
 # and can leave a stubborn grandchild to exercise process-group cleanup.
 FAKE = r'''import json, os, signal, subprocess, sys, time
 from pathlib import Path
+if sys.argv[1:3] == ['debug', 'models']:
+    levels = [{'effort': e} for e in ('low', 'medium', 'high', 'xhigh')]
+    print(json.dumps({'models': [
+        {'slug': 'gpt-6-astra', 'visibility': 'list', 'supported_reasoning_levels': levels + [{'effort': 'ultra'}]},
+        {'slug': 'gpt-5.6-sol', 'visibility': 'list', 'supported_reasoning_levels': levels},
+        {'slug': 'gpt-6-sol', 'visibility': 'list', 'supported_reasoning_levels': levels},
+        {'slug': 'gpt-5.10-luna', 'visibility': 'list', 'supported_reasoning_levels': levels},
+        {'slug': 'gpt-5.9-luna', 'visibility': 'list', 'supported_reasoning_levels': levels},
+        {'slug': 'gpt-7-sol', 'visibility': 'hide', 'supported_reasoning_levels': levels},
+        {'slug': 'nova-preview', 'visibility': 'list', 'priority': 9, 'supported_reasoning_levels': levels},
+        {'slug': 'davinci', 'visibility': 'list', 'supported_reasoning_levels': [{'description': 'no effort key'}]},
+        {'slug': 42}]}))
+    sys.exit(0)
 raw = sys.stdin.read()
 try:
     cfg = json.loads(raw.split('\n\n',1)[-1])
@@ -34,7 +47,7 @@ tool = Path(sys.argv[0]).name
 capture = {'argv':sys.argv[1:], 'stdin':raw, 'pid':os.getpid(),
            'effort':os.environ.get('CLAUDE_CODE_EFFORT_LEVEL'),
            'fast_disabled':os.environ.get('CLAUDE_CODE_DISABLE_FAST_MODE')}
-with open('fake-calls.jsonl', 'a') as f:
+with open(os.environ.get('FAKE_CALLS', 'fake-calls.jsonl'), 'a') as f:
     f.write(json.dumps(capture) + '\n')
 if cfg.get('ignore_signals'):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -66,7 +79,7 @@ if cfg.get('malformed'):
     print('this is not json', flush=True)
 if cfg.get('progress'):
     if tool == 'claude':
-        emit({'type':'assistant','message':{'model':'claude-fable-5-1','content':[{'type':'text','text':cfg['progress']}]}})
+        emit({'type':'assistant','message':{'model':cfg.get('model','claude-fable-5-1'),'content':[{'type':'text','text':cfg['progress']}]}})
     else:
         emit({'type':'item.completed','item':{'type':'agent_message','text':cfg['progress']}})
 time.sleep(cfg.get('sleep', 0))
@@ -107,6 +120,7 @@ class LifecycleTests(unittest.TestCase):
             executable.chmod(0o700)
         self.env = os.environ.copy()
         self.env['PATH'] = str(self.bindir) + os.pathsep + self.env.get('PATH','')
+        self.env['FAKE_CALLS'] = str(self.cwd / 'fake-calls.jsonl')
         self.ids = set()
         self.seq = 0
 
@@ -134,9 +148,9 @@ class LifecycleTests(unittest.TestCase):
         path.write_text(json.dumps(cfg))
         return path
 
-    def call(self, *args, check=True, timeout=15):
+    def call(self, *args, check=True, timeout=15, env=None):
         p = subprocess.run([sys.executable, str(HELPER), '--root', str(self.registry),
-                            *map(str,args)], env=self.env, text=True,
+                            *map(str,args)], env=env or self.env, text=True, cwd=self.cwd,
                            capture_output=True, timeout=timeout)
         try:
             value = json.loads(p.stdout)
@@ -310,7 +324,7 @@ class LifecycleTests(unittest.TestCase):
             else:
                 self.fail('Owned process survived stop: %s'%pid)
 
-    def test_send_resumes_exact_session_and_uses_pinned_defaults(self):
+    def test_send_resumes_exact_session_and_uses_flagship_defaults(self):
         for tool in ('codex','claude'):
             with self.subTest(tool=tool):
                 job=self.start(tool=tool)
@@ -331,6 +345,159 @@ class LifecycleTests(unittest.TestCase):
                 else:
                     self.assertIn('claude-fable-5-1',joined)
                     self.assertEqual(captured['fast_disabled'],'1')
+
+    def last_argv(self):
+        return self.captures()[-1]['argv']
+
+    def test_codex_family_resolves_to_newest_listed_release(self):
+        for family,expected in (('sol','gpt-6-sol'),('luna','gpt-5.10-luna'),('astra','gpt-6-astra')):
+            with self.subTest(family=family):
+                job=self.start(model=family,effort='xhigh')
+                result=self.terminal(job['offload_id'])
+                self.assertEqual(result['state'],'done')
+                self.assertEqual(result['resolved_model'],expected)
+                self.assertEqual(result['effort'],'xhigh')
+                argv=self.last_argv()
+                self.assertEqual(argv[argv.index('-m')+1],expected)
+                self.assertIn('model_reasoning_effort="xhigh"',argv)
+
+    def test_codex_exact_model_unknown_family_and_bad_effort(self):
+        job=self.start(model='gpt-5.6-sol')
+        self.assertEqual(self.terminal(job['offload_id'])['resolved_model'],'gpt-5.6-sol')
+        prompt=self.prompt({})
+        for options in (['--model','terra'],['--model','gpt-9-nope'],['--model','astra','--effort','max']):
+            with self.subTest(options=options):
+                reply=self.call('start','--tool','codex','--cwd',self.cwd,'--prompt-file',prompt,*options,check=False)
+                self.assertIn('error',reply)
+
+    def test_claude_family_alias_verified_by_family_and_pinned_on_send(self):
+        job=self.start({'model':'claude-opus-5-5[1m]'},tool='claude',model='Opus',effort='max')
+        result=self.terminal(job['offload_id'])
+        self.assertEqual(result['state'],'done',result)
+        self.assertEqual(result['model_family'],'opus')
+        captured=self.captures()[-1]
+        self.assertEqual(captured['argv'][captured['argv'].index('--model')+1],'opus')
+        self.assertEqual(captured['effort'],'max')
+        self.call('send',job['offload_id'],'--prompt-file',self.prompt({'model':'claude-opus-5-5[1m]'}),'--request-id','two')
+        self.assertEqual(self.terminal(job['offload_id'])['state'],'done')
+        argv=self.last_argv()
+        self.assertEqual(argv[argv.index('--model')+1],'claude-opus-5-5[1m]')
+
+    def test_claude_other_family_or_other_exact_release_is_failure(self):
+        for model,observed in (('opus','claude-fable-5-1'),('claude-opus-5-5','claude-opus-5-1'),('sonnet','claude-sonnet-5')):
+            with self.subTest(model=model,observed=observed):
+                result=self.terminal(self.start({'model':observed},tool='claude',model=model)['offload_id'])
+                self.assertEqual(result['state'],'failed' if not observed.startswith('claude-'+model) else 'done')
+
+    def test_codex_models_lists_catalogue_and_newest_per_family(self):
+        result=self.call('models','--tool','codex')
+        ids=[m['id'] for m in result['models']]
+        self.assertEqual(result['latest_by_family'],{'astra':'gpt-6-astra','sol':'gpt-6-sol','luna':'gpt-5.10-luna'})
+        self.assertNotIn('gpt-7-sol',ids)
+        preview=next(m for m in result['models'] if m['id']=='nova-preview')
+        self.assertIsNone(preview['family'])
+        self.assertIn('xhigh',preview['efforts'])
+        self.assertIn('gpt-7-sol',[m['id'] for m in self.call('models','--tool','codex','--all')['models']])
+        # A slug outside the naming convention is still usable as an exact model.
+        self.assertEqual(self.terminal(self.start(model='nova-preview')['offload_id'])['resolved_model'],'nova-preview')
+
+    def test_claude_models_aliases_probe_and_api(self):
+        env={k:v for k,v in self.env.items() if k not in ('ANTHROPIC_API_KEY','CLAUDECODE')}
+        result=self.call('models','--tool','claude','--probe','opus',env=env)
+        self.assertEqual(result['source'],'Claude Code aliases')
+        self.assertIn('opus',result['aliases'])
+        self.assertEqual(result['probe'],{'opus':'claude-fable-5-1'})  # the fake always reports Fable
+        self.assertIn('opus',self.captures()[-1]['argv'])
+
+        import http.server, threading
+        body=json.dumps({'data':[{'id':'claude-opus-5-1','created_at':'2026-03-01T00:00:00Z'},
+                                 {'id':'claude-opus-5-5','created_at':'2026-08-01T00:00:00Z'},
+                                 {'id':'claude-haiku-4-5-20251001','created_at':'2025-10-01T00:00:00Z'}]}).encode()
+        seen={}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.update(path=self.path,key=self.headers.get('x-api-key'))
+                self.send_response(200); self.end_headers(); self.wfile.write(body)
+            def log_message(self,*a): pass
+        server=http.server.HTTPServer(('127.0.0.1',0),Handler)
+        threading.Thread(target=server.serve_forever,daemon=True).start()
+        try:
+            result=self.call('models','--tool','claude',env={**env,'ANTHROPIC_API_KEY':'test-key',
+                             'ANTHROPIC_BASE_URL':'http://127.0.0.1:%d'%server.server_port})
+        finally:
+            server.shutdown()
+        self.assertEqual(seen['key'],'test-key')
+        self.assertTrue(seen['path'].startswith('/v1/models'))
+        self.assertEqual(result['latest_by_family'],{'opus':'claude-opus-5-5','haiku':'claude-haiku-4-5-20251001'})
+
+    def test_claude_alias_forms_and_provider_ids(self):
+        # (requested --model, model Claude reports, expected state)
+        cases=(('opus[1m]','claude-opus-5-5[1m]','done'),
+               ('opus[1m]','claude-sonnet-5','failed'),
+               ('claude-haiku-4-5','claude-haiku-4-5-20251001','done'),
+               ('CLAUDE-OPUS-5-5','claude-opus-5-5','done'),
+               ('opus','us.anthropic.claude-opus-5-5-20260801-v1:0','done'),
+               ('default','claude-sonnet-5','done'),
+               ('lyra','claude-opus-5-5','failed'))
+        for model,observed,state in cases:
+            with self.subTest(model=model,observed=observed):
+                result=self.terminal(self.start({'model':observed},tool='claude',model=model)['offload_id'])
+                self.assertEqual(result['state'],state,result)
+        self.assertFalse(result['model_verified'] if model=='default' else False)
+
+    def test_send_refused_after_model_mismatch(self):
+        job=self.start({'model':'claude-haiku-4-5'},tool='claude',model='opus')
+        self.assertEqual(self.terminal(job['offload_id'])['state'],'failed')
+        reply=self.call('send',job['offload_id'],'--prompt-file',self.prompt({}),'--request-id','again',check=False)
+        self.assertIn('model check',reply['error'])
+
+    def test_effort_is_validated_and_normalized(self):
+        prompt=self.prompt({})
+        for tool,effort in (('codex','high"\nmodel="x'),('claude','ultra'),('codex','HIGH ')):
+            with self.subTest(tool=tool,effort=effort):
+                reply=self.call('start','--tool',tool,'--cwd',self.cwd,'--prompt-file',prompt,'--effort',effort,check=False)
+                if effort=='HIGH ':
+                    self.ids.add(reply['offload_id'])
+                    self.assertEqual(reply['effort'],'high')
+                else:
+                    self.assertIn('error',reply)
+
+    def test_codex_odd_catalogue_entries(self):
+        # A letters-only slug is an exact model, not an unknown family; no effort list means no check.
+        result=self.terminal(self.start(model='davinci',effort='max')['offload_id'])
+        self.assertEqual((result['state'],result['resolved_model']),('done','davinci'))
+
+    def test_allow_tool_adds_to_default_grants(self):
+        job=self.start(tool='claude',mode='edit',tools='Read,Grep,Bash',allow_tool='Bash(git diff:*)')
+        self.terminal(job['offload_id'])
+        argv=self.last_argv()
+        self.assertEqual(argv[argv.index('--allowedTools')+1].split(','),['Read','Grep','Bash(git diff:*)'])
+
+    def test_retry_of_pre_selection_manifest_stays_idempotent(self):
+        job=self.start(tool='codex',ident='legacy-job')
+        self.terminal(job['offload_id'])
+        manifest=self.registry/'legacy-job'/'offload.json'
+        meta=json.loads(manifest.read_text())
+        import hashlib
+        prompt=Path(self.captures()[-1]['stdin'].split('\n\n',1)[-1])
+        old={k:v for k,v in meta.items() if k not in ('model','effort','model_family','resolved_model','model_verified','start_hash')}
+        old['version']=2
+        text=(self.base/'input-1.json').read_text()
+        old['start_hash']=hashlib.sha256(json.dumps([{k:v for k,v in old.items() if k!='start_hash'},text],sort_keys=True).encode()).hexdigest()
+        manifest.write_text(json.dumps(old))
+        again=self.call('start','--tool','codex','--cwd',self.cwd,'--prompt-file',self.base/'input-1.json','--id','legacy-job','--interrupt-grace','0.3')
+        self.assertEqual(again['run'],1)
+
+    def test_legacy_manifest_keeps_its_pinned_model(self):
+        job=self.start(tool='claude')
+        self.terminal(job['offload_id'])
+        manifest=self.registry/job['offload_id']/'offload.json'
+        meta=json.loads(manifest.read_text())
+        for key in ('model','model_family','resolved_model','effort'):
+            meta.pop(key)
+        manifest.write_text(json.dumps(meta))
+        result=self.status(job['offload_id'])
+        self.assertEqual((result['state'],result['requested_model'],result['effort']),('done','claude-fable-5-1','high'))
 
     def test_active_send_is_rejected_without_second_child(self):
         job=self.start({'sleep':.7})

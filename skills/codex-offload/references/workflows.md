@@ -1,14 +1,14 @@
 # Codex handoff workflows
 
-**Advanced/direct-call reference.** Normal offloads use `scripts/offload.py` and [the helper contract](helper.md). The direct calls and legacy `run.py` recorder below do not provide leases or a watchdog. Keep the model preset, use a finite timeout, and retain a host process handle when using them.
+**Advanced/direct-call reference.** Normal offloads use `scripts/offload.py` and [the helper contract](helper.md). The direct calls and legacy `run.py` recorder below do not provide leases or a watchdog. Pass the chosen model/effort and the standard-speed preset explicitly, use a finite timeout, and retain a host process handle when using them.
 
-Verified CLI surface: **codex-cli 0.154.0**, 2026-09-17. Local help is authoritative for accepted flags; refresh it after upgrades. The [official noninteractive guide](https://learn.chatgpt.com/docs/non-interactive-mode) explains the supported execution contract. Some older examples use removed `codex mcp-server` or deprecated `--full-auto`; neither is the recommended handoff here.
+Verified CLI surface: **codex-cli 0.154.0**, 2026-09-17; help re-checked against 0.156.1 on 2026-09-24 (exec, resume, fork and review unchanged). Local help is authoritative for accepted flags; refresh it after upgrades. The [official noninteractive guide](https://learn.chatgpt.com/docs/non-interactive-mode) explains the supported execution contract. Some older examples use removed `codex mcp-server` or deprecated `--full-auto`; neither is the recommended handoff here.
 
 CLI 0.154.0 local verification: root `-a never` alone left `on-request` in exec turn metadata on this host. The lifecycle helper also passes exec-level `-c 'approval_policy="never"'`; a live resumed turn confirmed `never` with the read-only sandbox unchanged. This rejects unavailable escalations; it does not grant them.
 
-## Required model and speed
+## Model, effort and speed
 
-The user wants **GPT-6 Astra**, **high** reasoning effort, and **standard speed** for every offload. Pass `-m gpt-6-astra -c 'model_reasoning_effort="high"' -c 'service_tier="default"' -c 'approval_policy="never"' --disable fast_mode` explicitly on initial calls, reviews, resumes and forks. Keep these exec-level options before the subcommand. Do not inherit a cheaper model or Fast/priority tier from a profile. Do not downgrade or retry with another model when Astra is unavailable; report the blocker. Change this preset only when the user explicitly requests a different one. Verify effective model/effort/tier when runtime metadata is available; a model mismatch is not a valid completed offload.
+Choose the model and effort as described in SKILL.md; the examples use `$MODEL` and `$EFFORT` for those values. `codex exec -m` needs an exact slug: `offload.py models --tool codex` reports the newest release per family (`latest_by_family`). Always use **standard speed**. Pass `-m "$MODEL" -c "model_reasoning_effort=\"$EFFORT\"" -c 'service_tier="default"' -c 'approval_policy="never"' --disable fast_mode` explicitly on initial calls, reviews, resumes and forks. Keep these exec-level options before the subcommand. Do not inherit a different model or Fast/priority tier from a profile. Do not downgrade or retry with another model when the chosen one is unavailable; report the blocker. Verify effective model/effort/tier when runtime metadata is available; a model mismatch is not a valid completed offload.
 
 ## Prompt contract
 
@@ -35,8 +35,8 @@ For a second opinion, pass the raw problem and evidence without leading the chil
 Use the recorder for work that needs progress/status tracking. A short foreground call can be simpler:
 
 ```bash
-codex -a never exec -m gpt-6-astra \
-  -c 'model_reasoning_effort="high"' -c 'service_tier="default"' -c 'approval_policy="never"' \
+codex -a never exec -m "$MODEL" \
+  -c "model_reasoning_effort=\"$EFFORT\"" -c 'service_tier="default"' -c 'approval_policy="never"' \
   --disable fast_mode -C "$TARGET_DIR" -s read-only - < "$PROMPT_FILE"
 ```
 
@@ -52,7 +52,7 @@ Without `--json`, the final answer goes to stdout and progress to stderr. With `
 | Unattended refusal of escalation | Root option `-a never` |
 | Live web search | Root `--search`, only if relevant |
 | Configured profile | `-p NAME`; 0.154.0 loads `$CODEX_HOME/NAME.config.toml` |
-| Required model and effort | `-m gpt-6-astra -c 'model_reasoning_effort="high"'` |
+| Model and effort | `-m "$MODEL" -c "model_reasoning_effort=\"$EFFORT\""` |
 | Standard speed / no premium tier | `-c 'service_tier="default"' -c 'approval_policy="never"' --disable fast_mode` |
 | Discard resumable session history | `--ephemeral` |
 | Intentionally non-Git directory | `--skip-git-repo-check` |
@@ -71,8 +71,8 @@ Capture `thread_id` from `thread.started` (the recorder calls it `session_id`). 
 python3 "$SKILL_DIR/scripts/run.py" run \
   --tool codex --cwd "$TARGET_DIR" \
   --prompt-file "$FOLLOWUP_FILE" --run-dir "$NEXT_RUN_DIR" \
-  -- codex -a never exec -m gpt-6-astra \
-  -c 'model_reasoning_effort="high"' -c 'service_tier="default"' -c 'approval_policy="never"' \
+  -- codex -a never exec -m "$MODEL" \
+  -c "model_reasoning_effort=\"$EFFORT\"" -c 'service_tier="default"' -c 'approval_policy="never"' \
   --disable fast_mode -C "$TARGET_DIR" -s read-only \
   resume "$SESSION_ID" --json -o "$NEXT_RUN_DIR/final.md" -
 ```
@@ -86,8 +86,8 @@ Use `codex ... exec ... fork "$SESSION_ID" ... -` for an independent conversatio
 ## Review
 
 ```bash
-codex -a never exec -m gpt-6-astra \
-  -c 'model_reasoning_effort="high"' -c 'service_tier="default"' -c 'approval_policy="never"' \
+codex -a never exec -m "$MODEL" \
+  -c "model_reasoning_effort=\"$EFFORT\"" -c 'service_tier="default"' -c 'approval_policy="never"' \
   --disable fast_mode -C "$TARGET_DIR" -s read-only \
   review --uncommitted --json
 ```
@@ -97,8 +97,8 @@ Other targets: `review --base "$BASE_BRANCH"` or `review --commit "$COMMIT_SHA"`
 ## Structured output
 
 ```bash
-codex -a never exec -m gpt-6-astra \
-  -c 'model_reasoning_effort="high"' -c 'service_tier="default"' -c 'approval_policy="never"' \
+codex -a never exec -m "$MODEL" \
+  -c "model_reasoning_effort=\"$EFFORT\"" -c 'service_tier="default"' -c 'approval_policy="never"' \
   --disable fast_mode -C "$TARGET_DIR" -s read-only \
   --json --output-schema "$SCHEMA_FILE" \
   -o "$RESULT_FILE" - < "$PROMPT_FILE"
@@ -130,4 +130,4 @@ On macOS, a pending Xcode license can make `/usr/bin/git` unusable. This is a ma
 - [OpenAI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
 - Exact accepted options: [locally captured help](cli-reference.md).
 
-Model preset sources: installed model catalogue (`gpt-6-astra` supports `high`), [speed controls](https://learn.chatgpt.com/docs/agent-configuration/speed), and [configuration](https://learn.chatgpt.com/docs/config-file/config-reference). Verified 2026-09-17.
+Model selection sources: installed model catalogue (`codex debug models`), [speed controls](https://learn.chatgpt.com/docs/agent-configuration/speed), and [configuration](https://learn.chatgpt.com/docs/config-file/config-reference). Verified 2026-09-24.

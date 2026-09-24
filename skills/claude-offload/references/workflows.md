@@ -1,12 +1,12 @@
 # Claude Code handoff workflows
 
-**Advanced/direct-call reference.** Normal offloads use `scripts/offload.py` and [the helper contract](helper.md). The direct calls and legacy `run.py` recorder below do not provide leases or a watchdog. Keep the model preset, use a finite timeout, and retain a host process handle when using them.
+**Advanced/direct-call reference.** Normal offloads use `scripts/offload.py` and [the helper contract](helper.md). The direct calls and legacy `run.py` recorder below do not provide leases or a watchdog. Pass the chosen model/effort and the standard-speed preset explicitly, use a finite timeout, and retain a host process handle when using them.
 
-Verified CLI surface: **Claude Code 2.1.274**, 2026-09-17. Prefer current local help when it disagrees with an example. For the execution contract, see [programmatic usage](https://code.claude.com/docs/en/headless).
+Verified CLI surface: **Claude Code 2.1.274**, 2026-09-17; help re-checked against 2.1.281 on 2026-09-24 (no changes to the flags used here). Prefer current local help when it disagrees with an example. For the execution contract, see [programmatic usage](https://code.claude.com/docs/en/headless).
 
-## Required model and speed
+## Model, effort and speed
 
-The user wants **Fable**, **high** effort, and **standard speed** for every offload. Pin the current verified Fable release with `--model claude-fable-5-1 --effort high`. Set `CLAUDE_CODE_DISABLE_FAST_MODE=1` and `CLAUDE_CODE_EFFORT_LEVEL=high` on the child invocation, and pass `--settings '{"fastMode":false,"ultracode":false}'` (merge these keys into any task-required settings). Apply the same preset to resumes, forks, and native background launches. The full model ID avoids an overridden `fable` alias; Ultracode is off so it cannot raise effort to xhigh. Do not add `--fallback-model` or choose Opus/Sonnet/Haiku when Fable is unavailable. Report the blocker instead. Check `system/init.model`, assistant message model IDs and final `modelUsage` when available; report provider-imposed fallback rather than presenting it as a Fable result. Aggregate usage can include auxiliary Haiku calls from Claude Code itself; those are not evidence that the main task switched models. Change this preset only when the user explicitly requests a different one.
+Choose the model and effort as described in SKILL.md; the examples use `$MODEL` and `$EFFORT` for those values. `--model` takes a family alias (`fable`, `opus`, `sonnet`, `haiku`) for its newest release or a full ID for an exact one. Environment overrides such as `ANTHROPIC_DEFAULT_OPUS_MODEL` can redirect an alias, so check the reported model. Always use **standard speed**. Set `CLAUDE_CODE_DISABLE_FAST_MODE=1` and `CLAUDE_CODE_EFFORT_LEVEL` to the chosen effort on the child invocation, and pass `--settings '{"fastMode":false,"ultracode":false}'` (merge these keys into any task-required settings). Apply the same preset to resumes, forks, and native background launches; on resume, pass the full ID the session reported so it stays on the same release. Ultracode is off so it cannot raise effort beyond the chosen level. Do not add `--fallback-model` or switch models when the chosen one is unavailable. Report the blocker instead. Check `system/init.model`, assistant message model IDs and final `modelUsage` when available; report provider-imposed fallback rather than presenting it as a result from the requested model. Aggregate usage can include auxiliary Haiku calls from Claude Code itself; those are not evidence that the main task switched models.
 
 ## Prompt contract
 
@@ -28,8 +28,8 @@ For an independent opinion, present the evidence without supplying the answer yo
 For a short result without tools:
 
 ```bash
-env CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL=high \
-  claude -p --model claude-fable-5-1 --effort high \
+env CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL="$EFFORT" \
+  claude -p --model "$MODEL" --effort "$EFFORT" \
   --settings '{"fastMode":false,"ultracode":false}' --tools '' --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
   --permission-mode dontAsk --permission-prompts none \
   --output-format json < "$PROMPT_FILE" > "$RESULT_FILE"
@@ -48,8 +48,8 @@ Keep stderr separate. Check the actual CLI exit code rather than the last comman
 For ordinary authorized edits/tests, use `dontAsk` plus specific tools/rules. Example for a project whose verified test command is `npm test`:
 
 ```bash
-env CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL=high \
-  claude -p --model claude-fable-5-1 --effort high \
+env CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL="$EFFORT" \
+  claude -p --model "$MODEL" --effort "$EFFORT" \
   --settings '{"fastMode":false,"ultracode":false}' --output-format stream-json --verbose \
   --permission-mode dontAsk --permission-prompts none \
   --tools 'Read,Glob,Grep,Edit,Write,Bash' \
@@ -65,7 +65,7 @@ Replace the test rule with the exact project command. Running a test script exec
 
 ## Resume and fork
 
-Read the full `session_id` from the final envelope or `system/init`. Once the current run has ended, reuse the recorder with a fresh directory and add `--resume "$SESSION_ID"` to the same Claude options. Feed the follow-up via stdin. Reapply the Fable/high/standard preset and intended tool/permission configuration; it is part of the new invocation.
+Read the full `session_id` from the final envelope or `system/init`. Once the current run has ended, reuse the recorder with a fresh directory and add `--resume "$SESSION_ID"` to the same Claude options. Feed the follow-up via stdin. Reapply the model/effort/standard-speed preset and intended tool/permission configuration; it is part of the new invocation.
 
 `--fork-session --resume "$SESSION_ID"` continues under a new UUID. `--continue` picks the most recent conversation and is ambiguous during concurrent work. `--session-id UUID` names a new conversation; it is not a replacement for `--resume`. `--no-session-persistence` disables later resumption.
 
@@ -76,8 +76,8 @@ The installed `--system-prompt-snapshot on` default may preserve the original sy
 For work that must survive terminal detachment:
 
 ```bash
-env CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL=high \
-  claude --bg --model claude-fable-5-1 --effort high \
+env CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL="$EFFORT" \
+  claude --bg --model "$MODEL" --effort "$EFFORT" \
   --settings '{"fastMode":false,"ultracode":false}' --name 'bounded-review' --permission-mode dontAsk \
   'Review the requested files. Report findings only; do not edit, commit, push, or open a PR.'
 claude agents --json --all
@@ -94,8 +94,8 @@ Background sessions may create worktrees and automatically perform commit/push/P
 `--json-schema` takes a JSON **string**, unlike Codex's schema file flag. Pass it as one argv element. Example:
 
 ```bash
-env CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL=high \
-  claude -p --model claude-fable-5-1 --effort high \
+env CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL="$EFFORT" \
+  claude -p --model "$MODEL" --effort "$EFFORT" \
   --settings '{"fastMode":false,"ultracode":false}' --output-format json --tools '' \
   --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
   --permission-mode dontAsk --permission-prompts none \
@@ -138,4 +138,4 @@ After completion inspect modified/untracked files, the relevant tests, and the u
 - [Background sessions](https://code.claude.com/docs/en/agent-view)
 - Exact exposed flags: [locally captured help](cli-reference.md).
 
-Model preset sources: [Fable and effort](https://code.claude.com/docs/en/model-config), [disabling Fast mode](https://code.claude.com/docs/en/fast-mode). Verified 2026-09-17.
+Model selection sources: [model aliases and effort](https://code.claude.com/docs/en/model-config), [disabling Fast mode](https://code.claude.com/docs/en/fast-mode). Verified 2026-09-24.
